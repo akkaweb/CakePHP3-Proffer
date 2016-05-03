@@ -295,8 +295,6 @@ class ProfferShell extends Shell
             $this->_stop();
         }
 
-        $this->_stop();
-
         $config = $this->Table->behaviors()->Proffer->config();
         foreach ($config as $field => $settings) {
             if (!$this->Table->hasField($field)) {
