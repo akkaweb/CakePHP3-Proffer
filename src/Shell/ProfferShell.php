@@ -1,4 +1,5 @@
 <?php
+
 namespace Proffer\Shell;
 
 use Cake\Console\Shell;
@@ -11,7 +12,6 @@ use Proffer\Lib\ProfferPath;
  */
 class ProfferShell extends Shell
 {
-
     /**
      * Store the table instance
      *
@@ -33,6 +33,22 @@ class ProfferShell extends Shell
                 'description' => [__('Use this command to regenerate the thumbnails for a specific table.')],
                 'arguments' => [
                     'table' => ['help' => __('The table to regenerate thumbs for'), 'required' => true]
+                ],
+                'options' => [
+                    'path-class' => [
+                        'short' => 'p',
+                        'help' => __('Fully name spaced custom path class, you must use double backslash.')
+                    ],
+                    'plugin' => [
+                        'help' => __('Use model from within a plugin.')
+                    ],
+                    'image-class' => [
+                        'short' => 'i',
+                        'help' => __('Fully name spaced custom image transform class, you must use double backslash.')
+                    ],
+                    'remove-behaviors' => [
+                        'help' => __('The behaviors to remove before generate.'),
+                    ],
                 ]
             ]
         ]);
@@ -42,6 +58,16 @@ class ProfferShell extends Shell
                 'description' => [__('This command will delete images which are not part of the model configuration.')],
                 'arguments' => [
                     'table' => ['help' => __('The table to regenerate thumbs for'), 'required' => true]
+                ],
+                'options' => [
+                    'dry-run' => [
+                        'short' => 'd',
+                        'help' => __('Do a dry run and don\'t delete any files.'),
+                        'boolean' => true
+                    ],
+                    'remove-behaviors' => [
+                        'help' => __('The behaviors to remove before cleanup.'),
+                    ],
                 ]
             ],
         ]);
@@ -57,8 +83,9 @@ class ProfferShell extends Shell
     public function main()
     {
         $this->out('Welcome to the Proffer shell.');
-        $this->out('This shell can be used to regenerate thumbnails.');
-        $this->out("Please use 'bin/cake proffer.proffer -h' flag to get further help.");
+        $this->out('This shell can be used to regenerate thumbnails and cleanup unlinked images.');
+        $this->hr();
+        $this->out($this->OptionParser->help());
     }
 
     /**
@@ -69,76 +96,174 @@ class ProfferShell extends Shell
      */
     public function generate($table)
     {
-        $this->checkTable($table);
+        if (!empty($this->param('plugin'))) {
+
+            $plugin = (string) $this->param('plugin');
+
+            $this->checkTable("$plugin.$table");
+        } else {
+            $this->checkTable($table);
+        }
 
         $config = $this->Table->behaviors()->Proffer->config();
 
         foreach ($config as $field => $settings) {
-            $transform = new ImageTransform();
-
             $records = $this->{$this->Table->alias()}->find()
-                ->select([$field, $settings['dir']])
+                ->select([$this->Table->primaryKey(), $field, $settings['dir']])
                 ->where([
-                    "$field IS NOT NULL",
-                    "$field != ''"
-                ]);
+                "$field IS NOT NULL",
+                "$field != ''"
+            ]);
 
             foreach ($records as $item) {
-                $path = new ProfferPath($this->Table, $item, $field, $settings);
-                $engine = $settings['thumbnailMethod'];
+                if ($this->param('verbose')) {
+                    $this->out(
+                        __('Processing ' . $this->Table->alias() . ' ' . $item->get($this->Table->primaryKey()))
+                    );
+                }
 
-                foreach ($settings['thumbnailSizes'] as $prefix => $dimensions) {
-                    $image = $transform->makeThumbnails($path, $dimensions, $engine);
-                    $transform->saveThumbs($image, $path, $prefix);
+                if (!empty($this->param('path-class'))) {
+                    $class = (string) $this->param('path-class');
+                    $path = new $class($this->Table, $item, $field, $settings);
+                } else {
+                    $path = new ProfferPath($this->Table, $item, $field, $settings);
+                }
 
-                    $this->out(__('Thumbnails regenerated ' . $prefix . '_' . $item->get($field)));
+                if (!empty($this->param('image-class'))) {
+                    $class = (string) $this->param('image-class');
+                    $transform = new $class($this->Table, $path);
+                } else {
+                    $transform = new ImageTransform($this->Table, $path);
+                }
+
+                $transform->processThumbnails($settings);
+
+                if ($this->param('verbose')) {
+                    $this->out(__('Thumbnails regenerated for ' . $path->fullPath()));
+                } else {
+                    $this->out(__('Thumbnails regenerated for ' . $this->Table->alias() . ' ' . $item->get($field)));
                 }
             }
         }
+
+        $this->out($this->nl(0));
+        $this->out(__('<info>Completed</info>'));
     }
 
     /**
      * Clean up files associated with a table which don't have an entry in the db
      *
-     * @param string $table The name of the table
+     * @param string $table The name  of the table
      * @return void
      */
     public function cleanup($table)
     {
         $this->checkTable($table);
 
-        $okayToDestroy = $this->in(__('Are you sure? This will irreversibly delete files'), ['y', 'n'], 'n');
-        if ($okayToDestroy === 'N') {
-            $this->out(__('Aborted, no files deleted.'));
-            exit;
+        if (!$this->param('dry-run')) {
+            $okayToDestroy = $this->in(__('Are you sure? This will irreversibly delete files'), ['y', 'n'], 'n');
+            if ($okayToDestroy === 'N') {
+                $this->out(__('Aborted, no files deleted.'));
+                $this->_stop();
+            }
+        } else {
+            $this->out(__('<info>Performing dry run cleanup.</info>'));
+            $this->out($this->nl(0));
         }
 
-        $folders = glob(WWW_ROOT . 'files' . DS . strtolower($table) . DS . '*');
-        foreach ($folders as $folder) {
-            $config = $this->Table->behaviors()->Proffer->config();
-            $seed = pathinfo($folder, PATHINFO_BASENAME);
+        $config = $this->Table->behaviors()->Proffer->config();
 
-            foreach ($config as $field => $settings) {
-                $dir = $settings['dir'];
+        // Get the root upload folder for this table
+        $uploadFieldFolders = glob(WWW_ROOT . 'files' . DS . strtolower($table) . DS . '*');
 
-                $record = $this->Table->exists([$dir => $seed]);
+        // Loop through each upload field configured for this table (field)
+        foreach ($uploadFieldFolders as $fieldFolder) {
+            // Loop through each instance of an upload for this field (seed)
+            $pathFieldName = pathinfo($fieldFolder, PATHINFO_BASENAME);
+            $uploadFolders = glob($fieldFolder . DS . '*');
+            foreach ($uploadFolders as $seedFolder) {
+                // Does the seed exist in the db?
+                $seed = pathinfo($seedFolder, PATHINFO_BASENAME);
 
-                if (!$record) {
-                    $files = glob($folder . DS . '*');
-                    foreach ($files as $file) {
-                        unlink($file);
-                        $this->out(__("Deleted file '$file'"));
+                foreach ($config as $field => $settings) {
+                    if ($pathFieldName != $field) {
+                        continue;
+                    }
+
+                    $targets = [];
+
+                    $record = $this->{$this->Table->alias()}->find()
+                        ->select([
+                            $field,
+                            $settings['dir']
+                        ])
+                        ->where([
+                            $settings['dir'] => $seed
+                        ])
+                        ->first();
+
+                    if ($record) {
+                        $record = $record->toArray();
+                    } else {
+                        $record = [];
+                    }
+
+                    if (!in_array($seed, $record)) {
+                        // No it doesn't - remove the folder and it's contents - probably with a user prompt
+                        if ($this->param('dry-run')) {
+                            if ($this->param('verbose')) {
+                                $this->out(__("Would remove folder `$seedFolder`"));
+                            } else {
+                                $this->out(__("Would remove folder `$seed`"));
+                            }
+                        } else {
+                            array_map('unlink', glob($seedFolder . DS . '*'));
+                            rmdir($seedFolder);
+
+                            if ($this->param('verbose')) {
+                                $this->out(__("Remove `$seedFolder` folder and contents"));
+                            } else {
+                                $this->out(__("Removed `$seed` folder and contents"));
+                            }
+                        }
+                    } else {
+                        $files = glob($seedFolder . DS . '*');
+
+                        $filenames = array_map(function ($p)
+                        {
+                            return pathinfo($p, PATHINFO_BASENAME);
+                        }, $files);
+
+                        $targets[] = $record[$field];
+                        if (!empty($settings['thumbnailSizes'])) {
+                            foreach ($settings['thumbnailSizes'] as $prefix => $dimensions) {
+                                $targets[] = $prefix . '_' . $record[$field];
+                            }
+                        }
+
+                        $filesToRemove = array_diff($filenames, $targets);
+
+                        foreach ($filesToRemove as $file) {
+                            if ($this->param('dry-run') && $this->param('verbose')) {
+                                $this->out(__("Would delete `$seedFolder" . DS . "$file`"));
+                            } elseif ($this->param('dry-run')) {
+                                $this->out(__("Would delete `$file`"));
+                            } else {
+                                unlink($seedFolder . DS . $file);
+                                if ($this->param('verbose')) {
+                                    $this->out(__("Deleted `$seedFolder" . DS . "$file`"));
+                                } else {
+                                    $this->out(__("Deleted `$file`"));
+                                }
+                            }
+                        }
                     }
                 }
             }
-
-            if (!$record) {
-                rmdir($folder);
-                $this->out(__("Deleted folder '$folder'"));
-            }
         }
 
-        $this->out(__('Completed'));
+        $this->out($this->nl(0));
+        $this->out(__('<info>Completed</info>'));
     }
 
     /**
@@ -153,12 +278,12 @@ class ProfferShell extends Shell
             $this->Table = $this->loadModel($table);
         } catch (Exception $e) {
             $this->out(__('<error>' . $e->getMessage() . '</error>'));
-            exit;
+            $this->_stop();
         }
 
         if (get_class($this->Table) === 'AppModel') {
             $this->out(__('<error>The table could not be found, instance of AppModel loaded.</error>'));
-            exit;
+            $this->_stop();
         }
 
         if (!$this->Table->hasBehavior('Proffer')) {
@@ -167,7 +292,36 @@ class ProfferShell extends Shell
                 "' does not have the Proffer behavior attached.</error>"
             );
             $this->out($out);
-            exit;
+            $this->_stop();
+        }
+
+        $this->_stop();
+
+        $config = $this->Table->behaviors()->Proffer->config();
+        foreach ($config as $field => $settings) {
+            if (!$this->Table->hasField($field)) {
+                $out = __(
+                    "<error>The table '" . $this->Table->alias() .
+                    "' does not have the configured upload field in it's schema.</error>"
+                );
+                $this->out($out);
+                $this->_stop();
+            }
+            if (!$this->Table->hasField($settings['dir'])) {
+                $out = __(
+                    "<error>The table '" . $this->Table->alias() .
+                    "' does not have the configured dir field in it's schema.</error>"
+                );
+                $this->out($out);
+                $this->_stop();
+            }
+        }
+
+        if ($this->param('remove-behaviors')) {
+            $removeBehaviors = explode(',', (string) $this->param('remove-behaviors'));
+            foreach ($removeBehaviors as $removeBehavior) {
+                $this->Table->removeBehavior($removeBehavior);
+            }
         }
     }
 }
